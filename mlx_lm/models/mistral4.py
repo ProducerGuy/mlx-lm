@@ -202,24 +202,64 @@ class Mistral4Attention(nn.Module):
         # kernel without materialising a (B, H, L, S) score tensor in RAM.
         # Correctness: dot(q_nope, k_nope) + dot(q_pe, k_pe)
         #            = dot(concat(q_nope, q_pe), concat(k_nope, k_pe))
+        # Check if latent is quantized (tuple from QuantizedLatentKVCache)
+        latent_is_quantized = isinstance(kv_latent, tuple)
+
         if L == 1:
-            # Generation: absorb W_UK into q_nope; K = concat(c_kv, k_pe)
             q_nope = self.embed_q(q_nope)                        # (B, H, 1, kv_lora_rank)
-            k = mx.concatenate([kv_latent, k_pe], axis=-1)       # (B, 1, S, kv_lora_rank + qk_rope_head_dim)
-            q = mx.concatenate([q_nope, q_pe], axis=-1)          # (B, H, 1, kv_lora_rank + qk_rope_head_dim)
-            v = kv_latent                                         # (B, 1, S, kv_lora_rank)
-            output = scaled_dot_product_attention(
-                q, k, v, cache=cache, scale=self.scale, mask=mask
-            )
-            output = self.unembed_out(output)                     # (B, H, 1, v_head_dim)
+
+            if latent_is_quantized:
+                # INT4 path: split nope/rope scoring with quantized_matmul
+                lat_w, lat_s, lat_b = kv_latent
+                gs = cache.group_size
+                bits = cache._bits
+
+                q_nope_s = q_nope * self.scale
+                q_pe_s = q_pe * self.scale
+
+                nope_scores = mx.quantized_matmul(
+                    q_nope_s, lat_w, scales=lat_s, biases=lat_b,
+                    transpose=True, group_size=gs, bits=bits,
+                )
+                rope_scores = q_pe_s @ k_pe.transpose(0, 1, 3, 2)
+                scores = nope_scores + rope_scores
+
+                if mask is not None:
+                    if mask.dtype == mx.bool_:
+                        scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+                    else:
+                        scores += mask
+
+                weights = mx.softmax(scores, axis=-1, precise=True)
+
+                output = mx.quantized_matmul(
+                    weights, lat_w, scales=lat_s, biases=lat_b,
+                    transpose=False, group_size=gs, bits=bits,
+                )
+                output = self.unembed_out(output)
+            else:
+                # fp16 path: standard concatenated attention
+                k = mx.concatenate([kv_latent, k_pe], axis=-1)
+                q = mx.concatenate([q_nope, q_pe], axis=-1)
+                v = kv_latent
+                output = scaled_dot_product_attention(
+                    q, k, v, cache=cache, scale=self.scale, mask=mask
+                )
+                output = self.unembed_out(output)
         else:
-            # Prefill: expand latent to per-head K/V; broadcast k_pe to match
-            k_nope = self.embed_q(kv_latent, transpose=False)     # (B, H, S, qk_nope_head_dim)
+            # Prefill: dequantize if needed, then standard absorbed attention
+            if latent_is_quantized:
+                kv_latent = mx.dequantize(
+                    *kv_latent,
+                    group_size=cache.group_size,
+                    bits=cache._bits,
+                )
+            k_nope = self.embed_q(kv_latent, transpose=False)
             k = mx.concatenate(
                 [k_nope, mx.broadcast_to(k_pe, k_nope.shape)], axis=-1
-            )                                                      # (B, H, S, q_head_dim)
-            v = self.unembed_out(kv_latent)                       # (B, H, S, v_head_dim)
-            q = mx.concatenate([q_nope, q_pe], axis=-1)           # (B, H, L, q_head_dim)
+            )
+            v = self.unembed_out(kv_latent)
+            q = mx.concatenate([q_nope, q_pe], axis=-1)
             output = scaled_dot_product_attention(
                 q, k, v, cache=cache, scale=self.scale, mask=mask
             )
@@ -404,6 +444,18 @@ class Model(nn.Module):
         self.model = Mistral4Model(config)
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def make_cache(self):
+        """Return INT4 quantized latent caches for absorbed MLA.
+
+        Per arXiv 2603.04428: cache latent in INT4, RoPE in fp16.
+        """
+        from .cache import QuantizedLatentKVCache
+
+        return [
+            QuantizedLatentKVCache(group_size=64, bits=4)
+            for _ in range(self.args.num_hidden_layers)
+        ]
 
     def __call__(
         self,

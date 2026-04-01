@@ -407,6 +407,98 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class QuantizedLatentKVCache(_BaseCache):
+    """MLA cache: INT4 quantized latent + fp16 RoPE.
+
+    Per arXiv 2603.04428 and FlashMLA production pattern:
+    - 256-dim latent quantized to INT4 (group_size=64) on store
+    - 64-dim RoPE keys kept in fp16 (position-sensitive)
+    - Dequantized on fetch for standard attention
+    - ~4x memory reduction on the latent portion
+    """
+
+    step = 256
+
+    def __init__(self, group_size: int = 64, bits: int = 4):
+        self.latent_q = None     # quantized: (packed, scales, biases)
+        self.rope = None         # fp16
+        self.offset = 0
+        self.group_size = group_size
+        self._bits = bits
+
+    def update_and_fetch(self, keys, values):
+        """Store latent (keys) quantized, RoPE (values) in fp16.
+
+        Returns dequantized latent + fp16 RoPE for standard attention.
+        """
+        B, n_heads, num_steps, latent_dim = keys.shape
+        rope_dim = values.shape[-1]
+        prev = self.offset
+
+        if self.latent_q is None or (prev + num_steps) > self.latent_q[0].shape[2]:
+            el_per_int = 32 // self._bits  # 8 for 4-bit
+            n_alloc = (self.step + num_steps - 1) // self.step * self.step
+            shape = (B, n_heads, n_alloc)
+
+            new_latent = (
+                mx.zeros((*shape, latent_dim // el_per_int), dtype=mx.uint32),
+                mx.zeros((*shape, latent_dim // self.group_size), dtype=keys.dtype),
+                mx.zeros((*shape, latent_dim // self.group_size), dtype=keys.dtype),
+            )
+            new_rope = mx.zeros((B, n_heads, n_alloc, rope_dim), dtype=values.dtype)
+
+            if self.latent_q is not None:
+                if prev % self.step != 0:
+                    self.latent_q = tuple(x[..., :prev, :] for x in self.latent_q)
+                    self.rope = self.rope[..., :prev, :]
+                self.latent_q = tuple(
+                    mx.concatenate([old, new], axis=2)
+                    for old, new in zip(self.latent_q, new_latent))
+                self.rope = mx.concatenate([self.rope, new_rope], axis=2)
+            else:
+                self.latent_q = new_latent
+                self.rope = new_rope
+
+        self.offset += num_steps
+
+        # Quantize and store latent
+        q_data = mx.quantize(keys, group_size=self.group_size, bits=self._bits)
+        for i in range(3):
+            self.latent_q[i][..., prev:self.offset, :] = q_data[i]
+
+        # Store RoPE as-is
+        self.rope[..., prev:self.offset, :] = values
+
+        # Return quantized latent tuple + fp16 RoPE
+        # Attention code uses mx.quantized_matmul directly — no dequant
+        latent_out = tuple(x[..., :self.offset, :] for x in self.latent_q)
+        return latent_out, self.rope[..., :self.offset, :]
+
+    def size(self):
+        return self.offset
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.latent_q is None
+
+    @property
+    def nbytes(self):
+        if self.latent_q is None:
+            return 0
+        lat_bytes = sum(x.nbytes for x in self.latent_q)
+        return lat_bytes + self.rope.nbytes
+
+
 class RotatingKVCache(_BaseCache):
     step = 256
 

@@ -61,3 +61,9 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.language_model.model.layers
+
+    def make_cache(self):
+        if hasattr(self.language_model, "make_cache"):
+            return self.language_model.make_cache()
+        from .cache import KVCache
+        return [KVCache() for _ in range(len(self.layers))]
