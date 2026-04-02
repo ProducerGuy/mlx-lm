@@ -217,9 +217,10 @@ class Mistral4Attention(nn.Module):
                 assert lat_w.shape[1] == 1, f"Expected shared latent (head=1), got {lat_w.shape}"
                 assert k_pe.shape[1] == 1, f"Expected shared RoPE (head=1), got {k_pe.shape}"
 
-                # Pre-scale queries, squeeze sequence dim: (B,H,1,D) → (B,H,D)
-                q_n = (q_nope * self.scale).squeeze(2)
-                q_p = (q_pe * self.scale).squeeze(2)
+                # Squeeze sequence dim: (B,H,1,D) → (B,H,D)
+                # No pre-scaling — kernel applies scale at query load time
+                q_n = q_nope.squeeze(2)
+                q_p = q_pe.squeeze(2)
 
                 # Squeeze head dim from cache: (B,1,S,X) → (B,S,X)
                 lw = lat_w.squeeze(1)
@@ -227,10 +228,9 @@ class Mistral4Attention(nn.Module):
                 lb = lat_b.squeeze(1)
                 kp = k_pe.squeeze(1)
 
-                # Fused: dequant + nope/rope score + softmax + value accum
-                # scale=1.0 because queries are already pre-scaled above
+                # Fused: scale + dequant + nope/rope score + softmax + value accum
                 attn_out = mx.fast.mla_fused_sdpa(
-                    q_n, q_p, lw, ls, lb, kp, 1.0)
+                    q_n, q_p, lw, ls, lb, kp, self.scale)
 
                 # Restore shape: (B,H,256) → (B,H,1,256) for unembed
                 output = attn_out.reshape(B, self.num_heads, 1, self.kv_lora_rank)
