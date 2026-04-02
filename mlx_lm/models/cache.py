@@ -467,8 +467,8 @@ class QuantizedLatentKVCache(_BaseCache):
 
         self.offset += num_steps
 
-        # Quantize and store latent (3D)
-        q_data = mx.quantize(keys_3d, group_size=self.group_size, bits=self._bits)
+        # Quantize and store latent (3D) — fused single-dispatch kernel
+        q_data = mx.fast.mla_quantize_store(keys_3d)
         for i in range(3):
             self.latent_q[i][:, prev:self.offset, :] = q_data[i]
 
