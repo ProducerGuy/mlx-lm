@@ -213,24 +213,16 @@ class Mistral4Attention(nn.Module):
                 # Decode-only (L==1), shared latent (head dim=1 in cache)
                 lat_w, lat_s, lat_b = kv_latent
 
-                # Verify shared-latent cache layout
-                assert lat_w.shape[1] == 1, f"Expected shared latent (head=1), got {lat_w.shape}"
-                assert k_pe.shape[1] == 1, f"Expected shared RoPE (head=1), got {k_pe.shape}"
-
-                # Squeeze sequence dim: (B,H,1,D) → (B,H,D)
-                # No pre-scaling — kernel applies scale at query load time
+                # Squeeze sequence dim only: (B,H,1,D) → (B,H,D)
                 q_n = q_nope.squeeze(2)
                 q_p = q_pe.squeeze(2)
 
-                # Squeeze head dim from cache: (B,1,S,X) → (B,S,X)
-                lw = lat_w.squeeze(1)
-                ls = lat_s.squeeze(1)
-                lb = lat_b.squeeze(1)
-                kp = k_pe.squeeze(1)
+                # Cache returns 3D directly — no squeeze
+                # lat_w: (B,S,32), lat_s: (B,S,4), lat_b: (B,S,4), k_pe: (B,S,64)
 
                 # Fused: scale + dequant + nope/rope score + softmax + value accum
                 attn_out = mx.fast.mla_fused_sdpa(
-                    q_n, q_p, lw, ls, lb, kp, self.scale)
+                    q_n, q_p, lat_w, lat_s, lat_b, k_pe, self.scale)
 
                 # Restore shape: (B,H,256) → (B,H,1,256) for unembed
                 output = attn_out.reshape(B, self.num_heads, 1, self.kv_lora_rank)
@@ -252,6 +244,9 @@ class Mistral4Attention(nn.Module):
                     group_size=cache.group_size,
                     bits=cache._bits,
                 )
+                # Cache returns 3D (B,S,D) — restore head dim for prefill ops
+                kv_latent = mx.expand_dims(kv_latent, axis=1)
+                k_pe = mx.expand_dims(k_pe, axis=1)
             k_nope = self.embed_q(kv_latent, transpose=False)
             k = mx.concatenate(
                 [k_nope, mx.broadcast_to(k_pe, k_nope.shape)], axis=-1
