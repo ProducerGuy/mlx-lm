@@ -209,33 +209,31 @@ class Mistral4Attention(nn.Module):
             q_nope = self.embed_q(q_nope)                        # (B, H, 1, kv_lora_rank)
 
             if latent_is_quantized:
-                # INT4 path: split nope/rope scoring with quantized_matmul
+                # Fused quantized SDPA: single kernel dispatch replaces 5+
+                # Decode-only (L==1), shared latent (head dim=1 in cache)
                 lat_w, lat_s, lat_b = kv_latent
-                gs = cache.group_size
-                bits = cache._bits
 
-                q_nope_s = q_nope * self.scale
-                q_pe_s = q_pe * self.scale
+                # Verify shared-latent cache layout
+                assert lat_w.shape[1] == 1, f"Expected shared latent (head=1), got {lat_w.shape}"
+                assert k_pe.shape[1] == 1, f"Expected shared RoPE (head=1), got {k_pe.shape}"
 
-                nope_scores = mx.quantized_matmul(
-                    q_nope_s, lat_w, scales=lat_s, biases=lat_b,
-                    transpose=True, group_size=gs, bits=bits,
-                )
-                rope_scores = q_pe_s @ k_pe.transpose(0, 1, 3, 2)
-                scores = nope_scores + rope_scores
+                # Pre-scale queries, squeeze sequence dim: (B,H,1,D) → (B,H,D)
+                q_n = (q_nope * self.scale).squeeze(2)
+                q_p = (q_pe * self.scale).squeeze(2)
 
-                if mask is not None:
-                    if mask.dtype == mx.bool_:
-                        scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
-                    else:
-                        scores += mask
+                # Squeeze head dim from cache: (B,1,S,X) → (B,S,X)
+                lw = lat_w.squeeze(1)
+                ls = lat_s.squeeze(1)
+                lb = lat_b.squeeze(1)
+                kp = k_pe.squeeze(1)
 
-                weights = mx.softmax(scores, axis=-1, precise=True)
+                # Fused: dequant + nope/rope score + softmax + value accum
+                # scale=1.0 because queries are already pre-scaled above
+                attn_out = mx.fast.mla_fused_sdpa(
+                    q_n, q_p, lw, ls, lb, kp, 1.0)
 
-                output = mx.quantized_matmul(
-                    weights, lat_w, scales=lat_s, biases=lat_b,
-                    transpose=False, group_size=gs, bits=bits,
-                )
+                # Restore shape: (B,H,256) → (B,H,1,256) for unembed
+                output = attn_out.reshape(B, self.num_heads, 1, self.kv_lora_rank)
                 output = self.unembed_out(output)
             else:
                 # fp16 path: standard concatenated attention
