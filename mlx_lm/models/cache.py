@@ -479,6 +479,85 @@ class QuantizedLatentKVCache(_BaseCache):
         latent_out = tuple(x[:, :self.offset, :] for x in self.latent_q)
         return latent_out, self.rope[:, :self.offset, :]
 
+    def fused_attention(self, q_nope, q_pe, new_latent, new_kpe, scale):
+        """Combined cache update + SDPA in one kernel call.
+
+        Eliminates SliceUpdate full-cache copies by writing directly
+        into cache buffers via copy_shared_buffer aliasing.
+
+        Args:
+            q_nope: (B, H, D) absorbed query (post-embed_q, pre-scaled)
+            q_pe: (B, H, RD) RoPE query (pre-scaled)
+            new_latent: (B, 1, D) new token's raw latent (fp16)
+            new_kpe: (B, 1, RD) new token's RoPE key (fp16)
+            scale: attention scale
+
+        Returns:
+            sdpa_out: (B, H, D) attention output
+        """
+        # Hard assertions for decode-only contract
+        assert q_nope.ndim == 3, f"q_nope must be 3D (B,H,D), got {q_nope.shape}"
+        assert q_pe.ndim == 3, f"q_pe must be 3D (B,H,RD), got {q_pe.shape}"
+
+        # Squeeze head dim from new data: (B, 1, L, D) → (B, L, D)
+        if new_latent.ndim == 4:
+            assert new_latent.shape[1] == 1, f"Expected head=1, got {new_latent.shape}"
+            new_latent = new_latent.squeeze(1)
+        if new_kpe.ndim == 4:
+            assert new_kpe.shape[1] == 1, f"Expected head=1, got {new_kpe.shape}"
+            new_kpe = new_kpe.squeeze(1)
+
+        assert new_latent.shape[1] == 1, f"Append exactly 1 token, got {new_latent.shape[1]}"
+        assert new_kpe.shape[1] == 1, f"Append exactly 1 token, got {new_kpe.shape[1]}"
+
+        B = new_latent.shape[0]
+        latent_dim = new_latent.shape[-1]
+        rope_dim = new_kpe.shape[-1]
+
+        # Ensure cache is allocated
+        if self.latent_q is None or (self.offset + 1) > self.latent_q[0].shape[1]:
+            el_per_int = 32 // self._bits
+            n_alloc = ((self.offset + 1 + self.step - 1) // self.step) * self.step
+            shape = (B, n_alloc)
+
+            new_cache = (
+                mx.zeros((*shape, latent_dim // el_per_int), dtype=mx.uint32),
+                mx.zeros((*shape, latent_dim // self.group_size), dtype=new_latent.dtype),
+                mx.zeros((*shape, latent_dim // self.group_size), dtype=new_latent.dtype),
+            )
+            new_rope = mx.zeros((B, n_alloc, rope_dim), dtype=new_kpe.dtype)
+
+            if self.latent_q is not None:
+                if self.offset % self.step != 0:
+                    self.latent_q = tuple(x[:, :self.offset, :] for x in self.latent_q)
+                    self.rope = self.rope[:, :self.offset, :]
+                self.latent_q = tuple(
+                    mx.concatenate([old, new], axis=1)
+                    for old, new in zip(self.latent_q, new_cache))
+                self.rope = mx.concatenate([self.rope, new_rope], axis=1)
+            else:
+                self.latent_q = new_cache
+                self.rope = new_rope
+            mx.eval(*self.latent_q, self.rope)
+
+        assert self.offset < self.latent_q[0].shape[1], \
+            f"Cache full: offset={self.offset}, alloc={self.latent_q[0].shape[1]}"
+
+        # Fused: SDPA + quantize + cache append in one kernel
+        sdpa_out, upd_packed, upd_scales, upd_biases, upd_kpe = \
+            mx.fast.mla_fused_sdpa_v2(
+                q_nope, q_pe,
+                self.latent_q[0], self.latent_q[1], self.latent_q[2], self.rope,
+                new_latent, new_kpe,
+                scale, self.offset)
+
+        # CRITICAL: rebind cache references immediately (hard contract)
+        self.latent_q = (upd_packed, upd_scales, upd_biases)
+        self.rope = upd_kpe
+        self.offset += 1
+
+        return sdpa_out
+
     def size(self):
         return self.offset
 

@@ -23,6 +23,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import QuantizedLatentKVCache
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -193,51 +194,41 @@ class Mistral4Attention(nn.Module):
         # --- Expand latent for cache (1 "head") ---
         kv_latent = mx.expand_dims(kv_latent, axis=1)
 
-        if cache is not None:
-            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
-
-        # --- Absorbed attention ---
-        # Concatenate nope and rope components into unified Q/K so that
-        # mx.fast.scaled_dot_product_attention uses its tiled flash-attention
-        # kernel without materialising a (B, H, L, S) score tensor in RAM.
-        # Correctness: dot(q_nope, k_nope) + dot(q_pe, k_pe)
-        #            = dot(concat(q_nope, q_pe), concat(k_nope, k_pe))
-        # Check if latent is quantized (tuple from QuantizedLatentKVCache)
-        latent_is_quantized = isinstance(kv_latent, tuple)
-
-        if L == 1:
+        if L == 1 and cache is not None and isinstance(cache, QuantizedLatentKVCache):
+            # V2 FUSED PATH: SDPA + cache update in one kernel
+            # Eliminates SliceUpdate full-cache copies via copy_shared_buffer aliasing
             q_nope = self.embed_q(q_nope)                        # (B, H, 1, kv_lora_rank)
+            q_n = q_nope.squeeze(2)                              # (B, H, D)
+            q_p = q_pe.squeeze(2)                                # (B, H, RD)
 
-            if latent_is_quantized:
-                # Fused quantized SDPA: single kernel dispatch replaces 5+
-                # Decode-only (L==1), shared latent (head dim=1 in cache)
-                lat_w, lat_s, lat_b = kv_latent
+            # kv_latent and k_pe are raw (pre-cache), 4D with head dim
+            # Squeeze head dim for fused kernel: (B, 1, L, D) → (B, L, D)
+            attn_out = cache.fused_attention(
+                q_n, q_p, kv_latent, k_pe, self.scale)
 
-                # Squeeze sequence dim only: (B,H,1,D) → (B,H,D)
-                q_n = q_nope.squeeze(2)
-                q_p = q_pe.squeeze(2)
-
-                # Cache returns 3D directly — no squeeze
-                # lat_w: (B,S,32), lat_s: (B,S,4), lat_b: (B,S,4), k_pe: (B,S,64)
-
-                # Fused: scale + dequant + nope/rope score + softmax + value accum
-                attn_out = mx.fast.mla_fused_sdpa(
-                    q_n, q_p, lat_w, lat_s, lat_b, k_pe, self.scale)
-
-                # Restore shape: (B,H,256) → (B,H,1,256) for unembed
-                output = attn_out.reshape(B, self.num_heads, 1, self.kv_lora_rank)
-                output = self.unembed_out(output)
-            else:
-                # fp16 path: standard concatenated attention
-                k = mx.concatenate([kv_latent, k_pe], axis=-1)
-                q = mx.concatenate([q_nope, q_pe], axis=-1)
-                v = kv_latent
-                output = scaled_dot_product_attention(
-                    q, k, v, cache=cache, scale=self.scale, mask=mask
-                )
-                output = self.unembed_out(output)
+            # Restore shape: (B,H,256) → (B,H,1,256) for unembed
+            output = attn_out.reshape(B, self.num_heads, 1, self.kv_lora_rank)
+            output = self.unembed_out(output)
+        elif L == 1:
+            # Decode with fp16 cache (non-quantized path)
+            # Note: scaled_dot_product_attention does NOT update cache internally,
+            # it only computes attention. Cache update is our responsibility.
+            if cache is not None:
+                kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
+            q_nope = self.embed_q(q_nope)
+            k = mx.concatenate([kv_latent, k_pe], axis=-1)
+            q = mx.concatenate([q_nope, q_pe], axis=-1)
+            v = kv_latent
+            output = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=mask
+            )
+            output = self.unembed_out(output)
         else:
-            # Prefill: dequantize if needed, then standard absorbed attention
+            # Prefill: update cache first, then standard absorbed attention
+            # kv_latent already has 4 dims from expand_dims at line 195
+            if cache is not None:
+                kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
+            latent_is_quantized = isinstance(kv_latent, tuple)
             if latent_is_quantized:
                 kv_latent = mx.dequantize(
                     *kv_latent,
